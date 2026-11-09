@@ -15,6 +15,45 @@ from agent.usage_pricing import normalize_usage
 _SENSITIVE_HOOK_KEYS = {"api_key", "authorization", "proxy_authorization", "cookie", "set_cookie"}
 
 
+def _request_reasoning_effort(api_kwargs: Optional[dict[str, Any]]) -> Optional[str]:
+    """Return a recognized, unambiguous request effort without copying request content."""
+    from agent.reasoning_effort import EFFORT_LADDER
+
+    if not isinstance(api_kwargs, dict):
+        return None
+    extra = api_kwargs.get("extra_body")
+    if extra is not None and not isinstance(extra, dict):
+        return None
+
+    def value(key: str) -> Any:
+        # The OpenAI SDK applies extra_body as a shallow right-hand override.
+        return extra[key] if isinstance(extra, dict) and key in extra else api_kwargs.get(key)
+
+    reasoning = value("reasoning")
+    output_config = value("output_config")
+    if reasoning is not None and not isinstance(reasoning, dict):
+        return None
+    if output_config is not None and not isinstance(output_config, dict):
+        return None
+    levels = [value("reasoning_effort")]
+    if isinstance(reasoning, dict):
+        enabled = reasoning.get("enabled")
+        if enabled is not None and not isinstance(enabled, bool):
+            return None
+        if enabled is False:
+            levels.append("none")
+        levels.append(reasoning.get("effort"))
+        if enabled is True and any(isinstance(x, str) and x.strip().lower() == "none" for x in levels):
+            return None
+    if isinstance(output_config, dict):
+        levels.append(output_config.get("effort"))
+    levels = [level for level in levels if level is not None and level != ""]
+    if any(not isinstance(level, str) or level.strip().lower() not in EFFORT_LADDER for level in levels):
+        return None
+    normalized = {level.strip().lower() for level in levels}
+    return next(iter(normalized)) if len(normalized) == 1 else None
+
+
 def _model_dump(value: Any) -> Any:
     """``value.model_dump(mode="json")`` with graceful degradation for older pydantic signatures.
 
@@ -137,7 +176,11 @@ class ApiRequestHooksMixin:
             for key, value in (api_kwargs or {}).items()
             if key not in {"timeout", "http_client"}
         }
-        return self._sanitize_hook_payload({"method": "POST", "body": body})
+        payload = self._sanitize_hook_payload({"method": "POST", "body": body})
+        if isinstance(payload, dict):
+            # This tiny scalar survives the payload cap; None means do not guess.
+            payload["reasoning_effort"] = _request_reasoning_effort(api_kwargs)
+        return payload
 
     def _api_response_payload_for_hook(
         self, response: Any, assistant_message: Any, *, finish_reason: Optional[str]
